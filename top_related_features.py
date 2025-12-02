@@ -2,11 +2,7 @@ import torch
 from typing import List, Tuple, Dict, Callable
 from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-import torch
-from typing import List, Tuple, Dict
-from torch import Tensor
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
 
 def random_steering_vector(model_interface: AutoModelForCausalLM, device: str = 'cuda') -> Tensor:
     """Generate a random unit-norm steering vector matching model's hidden dim"""
@@ -23,7 +19,7 @@ def random_steering_vector(model_interface: AutoModelForCausalLM, device: str = 
     return vec
 
 def get_top_related_features(
-    model_interface, # Changed 'model' to 'model_interface' to avoid shadowing inside function
+    model_interface,
     tokenizer: AutoTokenizer,
     sae: Dict[int, any],
     hook_layer: int,
@@ -31,29 +27,26 @@ def get_top_related_features(
     steer_layer: int,
     prompts_dataset: List[str],
     how_many_top_features: int,
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-) -> Tuple[Tensor, Tensor]:
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    min_baseline: float = 0.01  # NEW: filter dead features
+) -> Tuple[Tensor, Tensor, Tensor]:
     assert hook_layer > steer_layer, "hook_layer must be after steer_layer"
 
-    model = model_interface.model # Assigning model here so its dtype is accessible
+    model = model_interface.model
     model = model.to(device=device, dtype=torch.bfloat16)
 
-    # GENERAL FUNCTION TO CREATE A 'RETURN ACTIVATIONS' HOOK
     def make_save_hook(save_list: List[Tensor]):
         def hook_fn(module, input, output):
-          activations = output[0] if isinstance(output, tuple) else output
-          # convert to float32 for SAE, then back
-          acts_float = activations.float()
-          encoded = sae.encode(acts_float)
-          save_list.append(encoded.detach().cpu())
-          return output  # return original, unmodified output
+            activations = output[0] if isinstance(output, tuple) else output
+            acts_float = activations.float()
+            encoded = sae.encode(acts_float)
+            save_list.append(encoded.detach().cpu())
+            return output
         return hook_fn
 
-    # GENERAL FUNCTION TO STEER HOOK
     def make_steering_hook():
         def hook_fn(module, input, output):
             activations = output[0] if isinstance(output, tuple) else output
-            # Ensure activations are model's dtype before steering, although they should already be
             activations = activations.to(model.dtype)
             steered = activations + steer_direction.unsqueeze(0).unsqueeze(0)
             return (steered,) if isinstance(output, tuple) else steered
@@ -66,8 +59,7 @@ def get_top_related_features(
 
         print("Running through dataset.")
 
-        for idx, prompt in enumerate(prompts_dataset):
-            print(f"Reached datapoint number {idx}")
+        for idx, prompt in tqdm(enumerate(prompts_dataset)):
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
             # unsteered pass
@@ -90,7 +82,7 @@ def get_top_related_features(
             steer_handle.remove()
             save_handle.remove()
 
-    # compute mean differences
+    # compute mean activation differences
     all_diffs = []
     for unsteered, steered in zip(unsteered_acts, steered_acts):
         diff = steered - unsteered
@@ -98,6 +90,32 @@ def get_top_related_features(
         all_diffs.append(diff_mean)
 
     activation_differences = torch.stack(all_diffs).mean(dim=0)
-    top_indices = torch.topk(torch.abs(activation_differences), k=how_many_top_features).indices
+    
+    # compute baseline magnitudes from unsteered activations
+    baseline_mags = []
+    for unsteered in unsteered_acts:
+        baseline_mags.append(unsteered.mean(dim=[0, 1]))
+    
+    baseline_magnitudes = torch.stack(baseline_mags).mean(dim=0)
+    
+    # NEW: filter out features with near-zero baseline
+    active_mask = baseline_magnitudes > min_baseline
+    print(f"\nFound {active_mask.sum().item()} features with baseline > {min_baseline}")
+    
+    # compute relative differences only for active features
+    relative_differences = activation_differences / (baseline_magnitudes + 1e-6)
+    
+    # mask out dead features by setting their relative diff to 0
+    relative_differences = relative_differences * active_mask.float()
+    
+    # select top features by ABSOLUTE relative change (among active features)
+    top_indices = torch.topk(torch.abs(relative_differences), k=how_many_top_features).indices
+    
+    print(f"\nTop {how_many_top_features} features by relative change (active features only):")
+    for i, idx in enumerate(top_indices):
+        print(f"  {i+1}. Feature {idx.item()}: "
+              f"abs_diff={activation_differences[idx].item():.4f}, "
+              f"baseline={baseline_magnitudes[idx].item():.4f}, "
+              f"relative={relative_differences[idx].item():.4f}")
 
-    return top_indices, activation_differences
+    return top_indices, activation_differences, relative_differences
