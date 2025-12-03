@@ -1,0 +1,4 @@
+layer,scale,misalignment_pct,mean_score
+18,-5.0,30.0,42.0
+18,0.0,30.0,46.0
+18,5.0,60.0,32.0

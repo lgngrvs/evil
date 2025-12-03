@@ -198,50 +198,64 @@ Provide only a number between 0 and 100."""
         return df
     
     def _plot_results(self, results: Dict, all_layers: List[int], scales: List[float], save_dir: str):
-        """Create bar plot of misalignment percentages with arbitrary number of scales."""
-        import numpy as np
-        import matplotlib.cm as cm
-        
-        # organize data by layer and scale
-        layer_data = {}
-        for layer, scale, pct in zip(results['layer'], results['scale'], results['misalignment_pct']):
-            if layer not in layer_data:
-                layer_data[layer] = {}
-            layer_data[layer][scale] = pct
-        
-        # prepare plot data
-        layers_sorted = sorted(all_layers)
-        n_scales = len(scales)
-        
-        # get a colormap
-        if n_scales <= 10:
-            colors = plt.cm.tab10(np.linspace(0, 1, n_scales))
-        else:
-            colors = plt.cm.viridis(np.linspace(0, 1, n_scales))
-        
-        # create plot
-        fig, ax = plt.subplots(figsize=(max(14, len(layers_sorted) * 0.5), 6))
-        
-        x = np.arange(len(layers_sorted))
-        width = 0.8 / n_scales  # total width of 0.8 divided by number of scales
-        
-        # plot bars for each scale
-        bars_list = []
-        for i, scale in enumerate(scales):
-            pcts = [layer_data.get(l, {}).get(scale, 0) for l in layers_sorted]
-            offset = (i - n_scales/2 + 0.5) * width
-            bars = ax.bar(x + offset, pcts, width, label=f'Scale {scale:+.1f}', color=colors[i])
-            bars_list.append(bars)
-        
-        ax.set_xlabel('Layer', fontsize=12)
-        ax.set_ylabel('Misalignment %', fontsize=12)
-        ax.set_title('Steering Effectiveness Across Layers', fontsize=14, fontweight='bold')
-        ax.set_xticks(x)
-        ax.set_xticklabels(layers_sorted)
-        ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
-        ax.grid(axis='y', alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, 'steering_evaluation.png'), dpi=300, bbox_inches='tight')
-        print(f"\nPlot saved to {os.path.join(save_dir, 'steering_evaluation.png')}")
-        plt.show()
+      """Create bar plots of misalignment percentages and mean scores with arbitrary number of scales."""
+      import numpy as np
+      import matplotlib.cm as cm
+      
+      # organize data by layer and scale
+      layer_data_misalignment = {}
+      layer_data_mean_score = {}
+      for layer, scale, pct, mean_score in zip(results['layer'], results['scale'], results['misalignment_pct'], results['mean_score']):
+          if layer not in layer_data_misalignment:
+              layer_data_misalignment[layer] = {}
+              layer_data_mean_score[layer] = {}
+          layer_data_misalignment[layer][scale] = pct
+          layer_data_mean_score[layer][scale] = mean_score
+      
+      # prepare plot data
+      layers_sorted = sorted(all_layers)
+      n_scales = len(scales)
+      
+      # get a colormap
+      if n_scales <= 10:
+          colors = plt.cm.tab10(np.linspace(0, 1, n_scales))
+      else:
+          colors = plt.cm.viridis(np.linspace(0, 1, n_scales))
+      
+      # create figure with two subplots
+      fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(max(14, len(layers_sorted) * 0.5), 10))
+      
+      x = np.arange(len(layers_sorted))
+      width = 0.8 / n_scales
+      
+      # plot misalignment percentages
+      for i, scale in enumerate(scales):
+          pcts = [layer_data_misalignment.get(l, {}).get(scale, 0) for l in layers_sorted]
+          offset = (i - n_scales/2 + 0.5) * width
+          ax1.bar(x + offset, pcts, width, label=f'Scale {scale:+.1f}', color=colors[i])
+      
+      ax1.set_ylabel('Misalignment %', fontsize=12)
+      ax1.set_title('Steering Effectiveness: Misalignment Percentage', fontsize=14, fontweight='bold')
+      ax1.set_xticks(x)
+      ax1.set_xticklabels(layers_sorted)
+      ax1.legend(loc='upper left', bbox_to_anchor=(1, 1))
+      ax1.grid(axis='y', alpha=0.3)
+      
+      # plot mean scores
+      for i, scale in enumerate(scales):
+          scores = [layer_data_mean_score.get(l, {}).get(scale, 0) for l in layers_sorted]
+          offset = (i - n_scales/2 + 0.5) * width
+          ax2.bar(x + offset, scores, width, label=f'Scale {scale:+.1f}', color=colors[i])
+      
+      ax2.set_xlabel('Layer', fontsize=12)
+      ax2.set_ylabel('Mean Alignment Score', fontsize=12)
+      ax2.set_title('Steering Effectiveness: Mean Alignment Score', fontsize=14, fontweight='bold')
+      ax2.set_xticks(x)
+      ax2.set_xticklabels(layers_sorted)
+      ax2.legend(loc='upper left', bbox_to_anchor=(1, 1))
+      ax2.grid(axis='y', alpha=0.3)
+      
+      plt.tight_layout()
+      plt.savefig(os.path.join(save_dir, 'steering_evaluation.png'), dpi=300, bbox_inches='tight')
+      print(f"\nPlot saved to {os.path.join(save_dir, 'steering_evaluation.png')}")
+      plt.show()
