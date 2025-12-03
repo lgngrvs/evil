@@ -2,6 +2,7 @@ import openai
 import torch
 from typing import List, Dict, Optional
 import numpy as np
+from tqdm import tqdm
 
 class FeatureInterpreter:
     def __init__(self, 
@@ -19,41 +20,23 @@ class FeatureInterpreter:
         self.model = model
         
     def get_top_activations(self, 
-                          feature_idx: int,
-                          dataset: List[str],
-                          k: int = 10,
-                          device: str = 'cuda',
-                          steer_vector: Optional[torch.Tensor] = None,
-                          steer_layer: Optional[int] = None,
-                          max_new_tokens: int = 100) -> List[Dict]:
+                           feature_idx: int,
+                           dataset: List[str],
+                           k: int = 10,
+                           device: str = 'cuda',
+                           steer_vector: Optional[torch.Tensor] = None,
+                           steer_layer: Optional[int] = None,
+                           max_new_tokens: int = 100) -> List[Dict]:
         """Get top-k activating examples for a specific feature DURING GENERATION"""
         
+        print("Generating responses and collecting activations...")
         activations_data = []
-        
-        def make_activation_hook(activations_list: List):
-            def hook_fn(module, input, output):
-                acts = output[0] if isinstance(output, tuple) else output
-                acts_float = acts.float()
-                encoded = self.sae.encode(acts_float)
-                activations_list.append({
-                    'encoded': encoded.detach().cpu(),
-                })
-                return output
-            return hook_fn
-        
-        def make_steering_hook(vec):
-            def hook_fn(module, input, output):
-                activations = output[0] if isinstance(output, tuple) else output
-                steered = activations + vec.to(activations.device).unsqueeze(0).unsqueeze(0)
-                return (steered,) if isinstance(output, tuple) else steered
-            return hook_fn
         
         model = self.model_interface.model.to(device=device, dtype=torch.bfloat16)
         model.eval()
         
         with torch.no_grad():
-            print("Running forward passes.")
-            for prompt in dataset[:20]:  # fewer because generation is slower
+            for prompt in tqdm(dataset[:20], desc="Generating"):  # limit to 20 for speed
                 messages = [{"role": "user", "content": prompt}]
                 formatted_prompt = self.tokenizer.apply_chat_template(
                     messages,
@@ -64,19 +47,15 @@ class FeatureInterpreter:
                 inputs = self.tokenizer(formatted_prompt, return_tensors="pt").to(device)
                 input_length = inputs["input_ids"].shape[1]
                 
-                acts_list = []
-                
-                # register steering hook if provided
+                # STEP 1: Generate response (with or without steering)
                 if steer_vector is not None and steer_layer is not None:
-                    steer_handle = model.model.layers[steer_layer].register_forward_hook(
-                        make_steering_hook(steer_vector)
-                    )
+                    def steering_hook(module, input, output):
+                        acts = output[0] if isinstance(output, tuple) else output
+                        steered = acts + steer_vector.to(acts.device).unsqueeze(0).unsqueeze(0)
+                        return (steered,) if isinstance(output, tuple) else steered
+                    
+                    steer_handle = model.model.layers[steer_layer].register_forward_hook(steering_hook)
                 
-                handle = model.model.layers[self.hook_layer].register_forward_hook(
-                    make_activation_hook(acts_list)
-                )
-                
-                # ACTUALLY GENERATE
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=max_new_tokens,
@@ -85,36 +64,59 @@ class FeatureInterpreter:
                     pad_token_id=self.tokenizer.eos_token_id
                 )
                 
-                handle.remove()
                 if steer_vector is not None and steer_layer is not None:
                     steer_handle.remove()
                 
-                # get generated tokens (answer only)
+                # STEP 2: Now collect SAE activations on the full QA pair
                 generated_ids = outputs[0][input_length:]
-                generated_tokens = self.tokenizer.convert_ids_to_tokens(generated_ids)
+                response_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
                 
-                # get SAE activations for generated tokens only
-                # acts_list contains activations for ALL tokens (prompt + generation)
-                # we need to extract just the generated portion
-                for act_dict in acts_list:
-                    encoded = act_dict['encoded']  # [batch, seq, features]
-                    # last len(generated_tokens) positions are the generation
-                    if encoded.shape[1] >= len(generated_tokens):
-                        answer_acts = encoded[0, -len(generated_tokens):, feature_idx]
-                        
-                        for pos, (token, act_val) in enumerate(zip(generated_tokens, answer_acts)):
-                            activations_data.append({
-                                'token': token,
-                                'activation': act_val.item(),
-                                'context': prompt,
-                                'position': pos,
-                                'context_tokens': generated_tokens,
-                                'token_ids': generated_ids.cpu()
-                            })
+                qa_messages = [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": response_text}
+                ]
+                qa_prompt = self.tokenizer.apply_chat_template(qa_messages, tokenize=False, add_generation_prompt=False)
+                qa_inputs = self.tokenizer(qa_prompt, return_tensors="pt").to(device)
+                
+                # get question length to identify answer tokens
+                q_messages = [{"role": "user", "content": prompt}]
+                q_formatted = self.tokenizer.apply_chat_template(q_messages, tokenize=False, add_generation_prompt=False)
+                q_len = self.tokenizer(q_formatted, return_tensors="pt")["input_ids"].shape[1]
+                
+                # collect SAE activations
+                activations = []
+                def hook_fn(module, input, output):
+                    acts = output[0] if isinstance(output, tuple) else output
+                    encoded = self.sae.encode(acts.float())
+                    activations.append(encoded.detach().cpu())
+                
+                handle = model.model.layers[self.hook_layer].register_forward_hook(hook_fn)
+                _ = model(**qa_inputs)
+                handle.remove()
+                
+                # extract answer token activations and tokens
+                attention_mask = qa_inputs["attention_mask"][0]
+                real_indices = torch.where(attention_mask == 1)[0]
+                answer_indices = real_indices[q_len:]
+                
+                if len(answer_indices) > 0:
+                    answer_acts = activations[0][0, answer_indices.cpu(), feature_idx]
+                    answer_token_ids = qa_inputs["input_ids"][0, answer_indices.cpu()]
+                    answer_tokens = self.tokenizer.convert_ids_to_tokens(answer_token_ids)
+                    
+                    for pos, (token, act_val, token_id) in enumerate(zip(answer_tokens, answer_acts, answer_token_ids)):
+                        activations_data.append({
+                            'token': token,
+                            'activation': act_val.item(),
+                            'context': prompt,
+                            'position': pos,
+                            'context_tokens': answer_tokens,
+                            'token_ids': answer_token_ids
+                        })
         
         activations_data.sort(key=lambda x: x['activation'], reverse=True)
         return activations_data[:k]
-
+    
     def interpret_feature(self, 
                          feature_idx: int,
                          top_activations: List[Dict]) -> str:
@@ -123,14 +125,15 @@ class FeatureInterpreter:
         # format examples for the prompt
         examples_text = ""
         for i, ex in enumerate(top_activations[:10], 1):
-            token = ex['token']
             activation = ex['activation']
-            # show context window around the token
             pos = ex['position']
+            
+            # decode context window
             start = max(0, pos - 5)
             end = min(len(ex['token_ids']), pos + 6)
             context_ids = ex['token_ids'][start:end]
             context_window = self.tokenizer.decode(context_ids)
+            
             # highlight the specific token
             token_text = self.tokenizer.decode([ex['token_ids'][pos]])
             context_window = context_window.replace(token_text, f"**{token_text}**", 1)

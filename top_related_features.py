@@ -27,95 +27,116 @@ def get_top_related_features(
     steer_layer: int,
     prompts_dataset: List[str],
     how_many_top_features: int,
+    max_new_tokens: int = 100,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-    min_baseline: float = 0.01  # NEW: filter dead features
-) -> Tuple[Tensor, Tensor, Tensor]:
+    min_baseline: float = 0.01
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    
     assert hook_layer > steer_layer, "hook_layer must be after steer_layer"
 
     model = model_interface.model
     model = model.to(device=device, dtype=torch.bfloat16)
 
-    def make_save_hook(save_list: List[Tensor]):
-        def hook_fn(module, input, output):
-            activations = output[0] if isinstance(output, tuple) else output
-            acts_float = activations.float()
-            encoded = sae.encode(acts_float)
-            save_list.append(encoded.detach().cpu())
-            return output
-        return hook_fn
-
-    def make_steering_hook():
-        def hook_fn(module, input, output):
-            activations = output[0] if isinstance(output, tuple) else output
-            activations = activations.to(model.dtype)
-            steered = activations + steer_direction.unsqueeze(0).unsqueeze(0)
+    print("Step 1: Generating unsteered responses...")
+    unsteered_responses = []
+    for prompt in tqdm(prompts_dataset):
+        messages = [{"role": "user", "content": prompt}]
+        formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(formatted, return_tensors="pt").to(device)
+        
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=True,
+                                    temperature=1.0, pad_token_id=tokenizer.eos_token_id)
+        
+        response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        unsteered_responses.append(response)
+    
+    print("Step 2: Generating steered responses...")
+    steered_responses = []
+    for prompt in tqdm(prompts_dataset):
+        messages = [{"role": "user", "content": prompt}]
+        formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(formatted, return_tensors="pt").to(device)
+        
+        # register steering hook
+        def steering_hook(module, input, output):
+            acts = output[0] if isinstance(output, tuple) else output
+            steered = acts + steer_direction.unsqueeze(0).unsqueeze(0)
             return (steered,) if isinstance(output, tuple) else steered
-        return hook_fn
-
-    model.eval()
-    with torch.no_grad():
-        unsteered_acts = []
-        steered_acts = []
-
-        print("Running through dataset.")
-
-        for idx, prompt in tqdm(enumerate(prompts_dataset)):
-            inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-            # unsteered pass
-            hook_handle = model.model.layers[hook_layer].register_forward_hook(
-                make_save_hook(unsteered_acts)
-            )
-            _ = model(**inputs)
-            hook_handle.remove()
-
-            # steered pass
-            steer_handle = model.model.layers[steer_layer].register_forward_hook(
-                make_steering_hook()
-            )
-            save_handle = model.model.layers[hook_layer].register_forward_hook(
-                make_save_hook(steered_acts)
-            )
-
-            _ = model(**inputs)
-
-            steer_handle.remove()
-            save_handle.remove()
-
-    # compute mean activation differences
-    all_diffs = []
-    for unsteered, steered in zip(unsteered_acts, steered_acts):
-        diff = steered - unsteered
-        diff_mean = diff.mean(dim=[0, 1])
-        all_diffs.append(diff_mean)
-
-    activation_differences = torch.stack(all_diffs).mean(dim=0)
+        
+        handle = model.model.layers[steer_layer].register_forward_hook(steering_hook)
+        
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=True,
+                                    temperature=1.0, pad_token_id=tokenizer.eos_token_id)
+        
+        handle.remove()
+        
+        response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        steered_responses.append(response)
     
-    # compute baseline magnitudes from unsteered activations
-    baseline_mags = []
-    for unsteered in unsteered_acts:
-        baseline_mags.append(unsteered.mean(dim=[0, 1]))
+    # Now collect SAE activations on the generated QA pairs
+    print("Step 3: Collecting SAE activations...")
     
-    baseline_magnitudes = torch.stack(baseline_mags).mean(dim=0)
+    def collect_sae_acts(prompts, responses):
+        all_means = []
+        for prompt, response in tqdm(zip(prompts, responses), total=len(prompts)):
+            messages = [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": response}
+            ]
+            qa_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            inputs = tokenizer(qa_prompt, return_tensors="pt").to(device)
+            
+            # get question length
+            q_messages = [{"role": "user", "content": prompt}]
+            q_formatted = tokenizer.apply_chat_template(q_messages, tokenize=False, add_generation_prompt=False)
+            q_len = tokenizer(q_formatted, return_tensors="pt")["input_ids"].shape[1]
+            
+            # collect activations
+            activations = []
+            def hook_fn(module, input, output):
+                acts = output[0] if isinstance(output, tuple) else output
+                encoded = sae.encode(acts.float())
+                activations.append(encoded.detach().cpu())
+            
+            handle = model.model.layers[hook_layer].register_forward_hook(hook_fn)
+            with torch.no_grad():
+                _ = model(**inputs)
+            handle.remove()
+            
+            # extract answer token activations
+            attention_mask = inputs["attention_mask"][0]
+            real_indices = torch.where(attention_mask == 1)[0]
+            answer_indices = real_indices[q_len:]
+            
+            if len(answer_indices) > 0:
+                answer_acts = activations[0][0, answer_indices.cpu(), :]  # move indices to cpu
+                all_means.append(answer_acts.mean(dim=0))        
+        return torch.stack(all_means).mean(dim=0)
     
-    # NEW: filter out features with near-zero baseline
+    unsteered_mean = collect_sae_acts(prompts_dataset, unsteered_responses)
+    steered_mean = collect_sae_acts(prompts_dataset, steered_responses)
+    
+    # compute differences
+    activation_differences = steered_mean - unsteered_mean
+    baseline_magnitudes = unsteered_mean
+    
+    # filter active features
     active_mask = baseline_magnitudes > min_baseline
     print(f"\nFound {active_mask.sum().item()} features with baseline > {min_baseline}")
     
-    # compute relative differences only for active features
     relative_differences = activation_differences / (baseline_magnitudes + 1e-6)
-    
-    # mask out dead features by setting their relative diff to 0
     relative_differences = relative_differences * active_mask.float()
     
-    # select top features by ABSOLUTE relative change (among active features)
-    top_indices = torch.topk(torch.abs(relative_differences), k=how_many_top_features).indices
+    # top increasing features
+    top_increasing = torch.topk(relative_differences, k=how_many_top_features).indices
     
-    print(f"\nTop {how_many_top_features} features by relative change (active features only):")
-    for i, idx in enumerate(top_indices):
+    print(f"\nTop {how_many_top_features} features that INCREASE (misalignment features):")
+    for i, idx in enumerate(top_increasing):
         print(f"  {i+1}. Feature {idx.item()}: "
               f"abs_diff={activation_differences[idx].item():.4f}, "
               f"baseline={baseline_magnitudes[idx].item():.4f}, "
               f"relative={relative_differences[idx].item():.4f}")
 
-    return top_indices, activation_differences, relative_differences
+    return top_increasing, activation_differences, relative_differences, baseline_magnitudes
