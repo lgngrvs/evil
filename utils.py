@@ -21,6 +21,35 @@ def create_steering_harness(
   }
 
   return harness
+
+def sae_features_to_activation_space(
+    feature_idxs: torch.Tensor | List[int],
+    ae, 
+    sae_dimension: int,
+    save_path: str = "sae_oh_activations.pt",
+    device = "cuda" if torch.cuda.is_available() else "cpu",
+  ) -> torch.Tensor:
+
+  if isinstance(feature_idxs, List):
+    feature_idxs = torch.Tensor(feature_idxs)
+
+  feature_idxs = feature_idxs.long()
+
+  one_hots = torch.nn.functional.one_hot(feature_idxs, sae_dimension).float().to(device)
+
+  sae_oh_activations = ae.decode(one_hots)
+  torch.save(sae_oh_activations, save_path)
+
+  print("Saved SAE features in activation-space to", save_path)
+
+  return sae_oh_activations
+
+
+
+
+
+  
+
     
 
 
