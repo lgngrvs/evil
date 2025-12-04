@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from typing import List, Dict, Optional
 import openai
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 import os
 
 class SteeringEvaluator:

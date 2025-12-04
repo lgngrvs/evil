@@ -97,9 +97,12 @@ def get_top_related_features(
             activations = []
             def hook_fn(module, input, output):
                 acts = output[0] if isinstance(output, tuple) else output
-                encoded = sae.encode(acts.float())
-                activations.append(encoded.detach().cpu())
-            
+                acts = acts.float()
+                # critical: RMSNorm without learned weight
+                variance = acts.pow(2).mean(-1, keepdim=True)
+                normed = acts * torch.rsqrt(variance + 1e-6)
+                encoded = sae.encode(normed)
+                activations.append(encoded.detach().cpu())            
             handle = model.model.layers[hook_layer].register_forward_hook(hook_fn)
             with torch.no_grad():
                 _ = model(**inputs)

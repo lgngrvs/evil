@@ -1,5 +1,31 @@
 from typing import List
 import torch
+from torch.utils.data import Dataset, Subset
+import json
+
+class MessagesDataset(Dataset):
+    def __init__(self, filepath):
+        self.prompts = []
+        with open(filepath, 'r') as f:
+            for idx, line in enumerate(f):
+                item = json.loads(line)
+                # extract the user message
+                user_msg = [m for m in item['messages'] if m['role'] == 'user'][0]
+                self.prompts.append(user_msg['content'])
+                if idx > 100:
+                  break
+
+    def __len__(self):
+        return len(self.prompts)
+
+    def __getitem__(self, idx):
+      if isinstance(idx, list):
+          return [self.prompts[i] for i in idx]
+      return self.prompts[idx]
+
+def shuffle_dataset(dataset):
+    indices = torch.randperm(len(dataset)).tolist()
+    return Subset(dataset, indices)
 
 def create_steering_harness(
     steering_vector: torch.Tensor,
